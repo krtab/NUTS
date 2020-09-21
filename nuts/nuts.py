@@ -55,8 +55,30 @@ Carlo", Matthew D. Hoffman & Andrew Gelman
 """
 import numpy as np
 from numpy import log, exp, sqrt
+import warnings
+from tqdm import tqdm
+import copy
 
 __all__ = ['nuts6']
+
+class OutputWasNan(Exception):
+    """An exception to be raised when the output of the logp function is nan."""
+    def __init__(self,f,args,kwd_args):
+        self.f = f,
+        self.args = args,
+        self.kwd_args = kwd_args
+
+class CheckNanWrapper():
+
+    def __init__(self, f):
+        self.f = f
+    
+    def __call__(self, *args, **kwd_args):
+        logp, grad = self.f(*args, **kwd_args)
+        if np.isnan(logp):
+            raise OutputWasNan(self.f,args,kwd_args)
+        else:
+            return logp, grad
 
 
 def leapfrog(theta, r, grad, epsilon, f):
@@ -104,32 +126,43 @@ def leapfrog(theta, r, grad, epsilon, f):
 def find_reasonable_epsilon(theta0, grad0, logp0, f):
     """ Heuristic for choosing an initial value of epsilon """
     epsilon = 1.
-    r0 = np.random.normal(0., 1., len(theta0))
+    
 
-    # Figure out what direction we should be moving epsilon.
-    _, rprime, gradprime, logpprime = leapfrog(theta0, r0, grad0, epsilon, f)
-    # brutal! This trick make sure the step is not huge leading to infinite
-    # values of the likelihood. This could also help to make sure theta stays
-    # within the prior domain (if any)
-    k = 1.
-    while np.isinf(logpprime) or np.isinf(gradprime).any():
-        k *= 0.5
-        _, rprime, _, logpprime = leapfrog(theta0, r0, grad0, epsilon * k, f)
+    loop_count = 0
+    while True:
+        if loop_count > 10:
+            raise ValueError("10 evaluation on the initial parameters were NaN.")
+        loop_count += 1
+        r0 = np.random.normal(0., 1., len(theta0))
+        # Figure out what direction we should be moving epsilon.
+        try:
+            _, rprime, gradprime, logpprime = leapfrog(theta0, r0, grad0, epsilon, f)
 
-    epsilon = 0.5 * k * epsilon
+            # brutal! This trick make sure the step is not huge leading to infinite
+            # values of the likelihood. This could also help to make sure theta stays
+            # within the prior domain (if any)
+            k = 1.
+            while np.isinf(logpprime) or np.isinf(gradprime).any():
+                k *= 0.5
+                _, rprime, _, logpprime = leapfrog(theta0, r0, grad0, epsilon * k, f)
 
-    # acceptprob = np.exp(logpprime - logp0 - 0.5 * (np.dot(rprime, rprime.T) - np.dot(r0, r0.T)))
-    # a = 2. * float((acceptprob > 0.5)) - 1.
-    logacceptprob = logpprime-logp0-0.5*(np.dot(rprime, rprime)-np.dot(r0,r0))
-    a = 1. if logacceptprob > np.log(0.5) else -1.
-    # Keep moving epsilon in that direction until acceptprob crosses 0.5.
-    # while ( (acceptprob ** a) > (2. ** (-a))):
-    while a * logacceptprob > -a * np.log(2):
-        epsilon = epsilon * (2. ** a)
-        _, rprime, _, logpprime = leapfrog(theta0, r0, grad0, epsilon, f)
-        # acceptprob = np.exp(logpprime - logp0 - 0.5 * ( np.dot(rprime, rprime.T) - np.dot(r0, r0.T)))
-        logacceptprob = logpprime-logp0-0.5*(np.dot(rprime, rprime)-np.dot(r0,r0))
+            epsilon = 0.5 * k * epsilon
 
+            # acceptprob = np.exp(logpprime - logp0 - 0.5 * (np.dot(rprime, rprime.T) - np.dot(r0, r0.T)))
+            # a = 2. * float((acceptprob > 0.5)) - 1.
+            logacceptprob = logpprime-logp0-0.5*(np.dot(rprime, rprime)-np.dot(r0,r0))
+            a = 1. if logacceptprob > np.log(0.5) else -1.
+            # Keep moving epsilon in that direction until acceptprob crosses 0.5.
+            # while ( (acceptprob ** a) > (2. ** (-a))):
+            while a * logacceptprob > -a * np.log(2):
+                epsilon = epsilon * (2. ** a)
+                _, rprime, _, logpprime = leapfrog(theta0, r0, grad0, epsilon, f)
+                # acceptprob = np.exp(logpprime - logp0 - 0.5 * ( np.dot(rprime, rprime.T) - np.dot(r0, r0.T)))
+                logacceptprob = logpprime-logp0-0.5*(np.dot(rprime, rprime)-np.dot(r0,r0))
+        except OutputWasNan:
+            pass
+        else:
+            break
     print("find_reasonable_epsilon=", epsilon)
 
     return epsilon
@@ -253,6 +286,8 @@ def nuts6(f, M, Madapt, theta0, delta=0.6):
     samples = np.empty((M + Madapt, D), dtype=float)
     lnprob = np.empty(M + Madapt, dtype=float)
 
+    f = CheckNanWrapper(f)
+
     logp, grad = f(theta0)
     samples[0, :] = theta0
     lnprob[0] = logp
@@ -270,70 +305,86 @@ def nuts6(f, M, Madapt, theta0, delta=0.6):
     epsilonbar = 1
     Hbar = 0
 
-    for m in range(1, M + Madapt):
-        # Resample momenta.
-        r0 = np.random.normal(0, 1, D)
-
-        #joint lnp of theta and momentum r
-        joint = logp - 0.5 * np.dot(r0, r0.T)
-
-        # Resample u ~ uniform([0, exp(joint)]).
-        # Equivalent to (log(u) - joint) ~ exponential(1).
-        logu = float(joint - np.random.exponential(1, size=1))
-
-        # if all fails, the next sample will be the previous one
-        samples[m, :] = samples[m - 1, :]
-        lnprob[m] = lnprob[m - 1]
-
-        # initialize the tree
-        thetaminus = samples[m - 1, :]
-        thetaplus = samples[m - 1, :]
-        rminus = r0[:]
-        rplus = r0[:]
-        gradminus = grad[:]
-        gradplus = grad[:]
-
-        j = 0  # initial heigth j = 0
-        n = 1  # Initially the only valid point is the initial point.
-        s = 1  # Main loop: will keep going until s == 0.
-
-        while (s == 1):
-            # Choose a direction. -1 = backwards, 1 = forwards.
-            v = int(2 * (np.random.uniform() < 0.5) - 1)
-
-            # Double the size of the tree.
-            if (v == -1):
-                thetaminus, rminus, gradminus, _, _, _, thetaprime, gradprime, logpprime, nprime, sprime, alpha, nalpha = build_tree(thetaminus, rminus, gradminus, logu, v, j, epsilon, f, joint)
+    for m in tqdm(range(1, M + Madapt)):
+        loop_count = 0
+        while True:
+            if (loop_count == 10) or (loop_count >= 100 and ((loop_count % 100) == 0)):
+                warnings.warn(f"{loop_count} attempts to build the tree.")
+            loop_count += 1
+            # Figure out what direction we should be moving epsilon.
+            try:
+                save = copy.deepcopy((logp, gamma,t0, kappa, mu, epsilonbar, Hbar, samples, lnprob, m, Madapt, delta, grad, epsilon, f))
+                logp, gamma,t0, kappa, mu, epsilonbar, Hbar, samples, lnprob, m, Madapt, delta, grad, epsilon, f = nuts6_internal(logp,gamma,t0,kappa,mu, epsilonbar, Hbar, samples, lnprob, m, Madapt, delta, grad, epsilon, f, D)
+            except OutputWasNan:
+                logp, gamma,t0, kappa, mu, epsilonbar, Hbar, samples, lnprob, m, Madapt, delta, grad, epsilon, f = save
             else:
-                _, _, _, thetaplus, rplus, gradplus, thetaprime, gradprime, logpprime, nprime, sprime, alpha, nalpha = build_tree(thetaplus, rplus, gradplus, logu, v, j, epsilon, f, joint)
-
-            # Use Metropolis-Hastings to decide whether or not to move to a
-            # point from the half-tree we just generated.
-            _tmp = min(1, float(nprime) / float(n))
-            if (sprime == 1) and (np.random.uniform() < _tmp):
-                samples[m, :] = thetaprime[:]
-                lnprob[m] = logpprime
-                logp = logpprime
-                grad = gradprime[:]
-            # Update number of valid points we've seen.
-            n += nprime
-            # Decide if it's time to stop.
-            s = sprime and stop_criterion(thetaminus, thetaplus, rminus, rplus)
-            # Increment depth.
-            j += 1
-
-        # Do adaptation of epsilon if we're still doing burn-in.
-        eta = 1. / float(m + t0)
-        Hbar = (1. - eta) * Hbar + eta * (delta - alpha / float(nalpha))
-        if (m <= Madapt):
-            epsilon = exp(mu - sqrt(m) / gamma * Hbar)
-            eta = m ** -kappa
-            epsilonbar = exp((1. - eta) * log(epsilonbar) + eta * log(epsilon))
-        else:
-            epsilon = epsilonbar
+                break
     samples = samples[Madapt:, :]
     lnprob = lnprob[Madapt:]
     return samples, lnprob, epsilon
+
+def nuts6_internal(logp, gamma,t0, kappa, mu, epsilonbar, Hbar, samples, lnprob, m, Madapt, delta, grad, epsilon, f, D):
+     # Resample momenta.
+    r0 = np.random.normal(0, 1, D)
+
+    #joint lnp of theta and momentum r
+    joint = logp - 0.5 * np.dot(r0, r0.T)
+
+    # Resample u ~ uniform([0, exp(joint)]).
+    # Equivalent to (log(u) - joint) ~ exponential(1).
+    logu = float(joint - np.random.exponential(1, size=1))
+
+    # if all fails, the next sample will be the previous one
+    samples[m, :] = samples[m - 1, :]
+    lnprob[m] = lnprob[m - 1]
+
+    # initialize the tree
+    thetaminus = samples[m - 1, :]
+    thetaplus = samples[m - 1, :]
+    rminus = r0[:]
+    rplus = r0[:]
+    gradminus = grad[:]
+    gradplus = grad[:]
+
+    j = 0  # initial heigth j = 0
+    n = 1  # Initially the only valid point is the initial point.
+    s = 1  # Main loop: will keep going until s == 0.
+
+    while (s == 1):
+        # Choose a direction. -1 = backwards, 1 = forwards.
+        v = int(2 * (np.random.uniform() < 0.5) - 1)
+
+        # Double the size of the tree.
+        if (v == -1):
+            thetaminus, rminus, gradminus, _, _, _, thetaprime, gradprime, logpprime, nprime, sprime, alpha, nalpha = build_tree(thetaminus, rminus, gradminus, logu, v, j, epsilon, f, joint)
+        else:
+            _, _, _, thetaplus, rplus, gradplus, thetaprime, gradprime, logpprime, nprime, sprime, alpha, nalpha = build_tree(thetaplus, rplus, gradplus, logu, v, j, epsilon, f, joint)
+
+        # Use Metropolis-Hastings to decide whether or not to move to a
+        # point from the half-tree we just generated.
+        _tmp = min(1, float(nprime) / float(n))
+        if (sprime == 1) and (np.random.uniform() < _tmp):
+            samples[m, :] = thetaprime[:]
+            lnprob[m] = logpprime
+            logp = logpprime
+            grad = gradprime[:]
+        # Update number of valid points we've seen.
+        n += nprime
+        # Decide if it's time to stop.
+        s = sprime and stop_criterion(thetaminus, thetaplus, rminus, rplus)
+        # Increment depth.
+        j += 1
+
+    # Do adaptation of epsilon if we're still doing burn-in.
+    eta = 1. / float(m + t0)
+    Hbar = (1. - eta) * Hbar + eta * (delta - alpha / float(nalpha))
+    if (m <= Madapt):
+        epsilon = exp(mu - sqrt(m) / gamma * Hbar)
+        eta = m ** -kappa
+        epsilonbar = exp((1. - eta) * log(epsilonbar) + eta * log(epsilon))
+    else:
+        epsilon = epsilonbar
+    return logp, gamma,t0, kappa, mu, epsilonbar, Hbar, samples, lnprob, m, Madapt, delta, grad, epsilon, f
 
 
 def test_nuts6():
